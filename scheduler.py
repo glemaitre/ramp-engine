@@ -3,12 +3,14 @@ import os
 import random
 import time
 
-from worker import LocalWorker
+from worker import CondaEnvWorker
 
 
 def _simulator_submission():
     """Give ``None`` or a submission id."""
-    return random.choice(['starting_kit', 'random_forest_10_10', None])
+    submission = random.choice(['starting_kit', 'random_forest_10_10', None])
+    print(f'The name of the submission generated is {submission}')
+    return submission
 
 
 class Scheduler:
@@ -25,10 +27,10 @@ class Scheduler:
     def __init__(self, event_loop=None, n_worker=1):
         self.event_loop = event_loop
         self.n_worker = n_worker
-        self._worker_queue = asyncio.Queue(loop=self.event_loop,
-                                           maxsize=self.n_worker)
-        self._process_queue = asyncio.LifoQueue(loop=self.event_loop,
-                                                maxsize=self.n_worker)
+        self._awaiting_worker_queue = asyncio.Queue(loop=self.event_loop,
+                                                    maxsize=self.n_worker)
+        self._processing_worker_queue = asyncio.LifoQueue(
+            loop=self.event_loop, maxsize=self.n_worker)
 
     async def fetch_from_db(self):
         """Coroutine to fetch submission from the database and create a worker.
@@ -38,53 +40,46 @@ class Scheduler:
             if generated_submission is not None:
                 # temporary path to the submissions
                 module_path = os.path.dirname(__file__)
-                ramp_kit_dir = os.path.join(module_path, 'kits', 'iris')
-                ramp_data_dir = ramp_kit_dir
-                worker = LocalWorker(conda_env='ramp',
-                                     submission=generated_submission,
-                                     ramp_data_dir=ramp_data_dir,
-                                     ramp_kit_dir=ramp_kit_dir)
-                await self._worker_queue.put(worker)
+                config = {'ramp_kit_dir': os.path.join(
+                              module_path, 'kits', 'iris'),
+                          'ramp_data_dir': os.path.join(
+                              module_path, 'kits', 'iris'),
+                          'local_log_folder': os.path.join(
+                              module_path, 'kits', 'iris', 'log'),
+                          'local_predictions_folder': os.path.join(
+                              module_path, 'kits', 'iris', 'predictions'),
+                          'conda_env': 'ramp'}
+                worker = CondaEnvWorker(config, generated_submission)
+                await self._awaiting_worker_queue.put(worker)
 
     async def launch_worker(self):
         """Coroutine to launch awaiting workers."""
         while True:
-            worker = await self._worker_queue.get()
-            print(f'launch the worker {worker}')
+            worker = await self._awaiting_worker_queue.get()
+            print(f'launch worker {worker}')
             worker.setup()
-            proc = await worker.launch_submission()
-            await self._process_queue.put((proc, worker))
-            print(f'Queuing the process {proc}')
+            await worker.launch_submission()
+            await self._processing_worker_queue.put(worker)
+            print(f'queue worker {worker}')
 
     async def collect_result(self):
         """Collect result from processed workers."""
         while True:
-            proc, worker = await self._process_queue.get()
-            if proc.returncode is None:
+            worker = await self._processing_worker_queue.get()
+            if worker.status == 'running':
                 # await process_queue.put(proc) lock proc.returncode to change
                 # status.
-                self._process_queue.put_nowait((proc, worker))
+                self._processing_worker_queue.put_nowait(worker)
                 await asyncio.sleep(0)
             else:
-                log, _ = await proc.communicate()
-                print(f'collect the log of the submission {proc}')
-                print(log)
-                # print(worker.collect_submission())
+                print(f'collect results of worker {worker}')
+                await worker.collect_results()
+                worker.teardown()
 
 
 if __name__ == "__main__":
-    # import os
-    # from worker import LocalWorker
-    # module_path = os.path.dirname(__file__)
-    # ramp_kit_dir = os.path.join(module_path, 'kits', 'iris')
-    # ramp_data_dir = ramp_kit_dir
-    # worker = LocalWorker(conda_env='ramp')
-    # worker.setup()
-    # worker.launch_submission()
-    # print(worker.collect_submission())
     loop = asyncio.get_event_loop()
     scheduler = Scheduler(event_loop=loop, n_worker=5)
     loop.run_until_complete(asyncio.gather(scheduler.fetch_from_db(),
                                            scheduler.launch_worker(),
                                            scheduler.collect_result()))
-    print('loop completed')
